@@ -22,6 +22,11 @@ class TermColor:
     underline = "\033[4m"
 
 
+ELF_HDR = b'\x7fELF'
+
+Data = Union[str, bytes, bytearray]
+
+
 class Log:
     @staticmethod
     def d(s):
@@ -49,11 +54,12 @@ class UnmapException(Exception):
 
 
 class Core2ELF:
-    def __init__(self, core_filename: Text, output_filename: Text):
+    def __init__(self, core_filename: Text, output_filename: Text) -> None:
         Log.d("Parsing core file ....")
         self.in_fp = open(core_filename, 'rb')
         self.out_fp = open(output_filename, 'wb')
         self.out_data = bytearray()
+        # parsed result of ELFFile
         self.e_core = elffile.ELFFile(self.in_fp)
 
         # check input file is a valid core file
@@ -61,20 +67,24 @@ class Core2ELF:
         if self.e_core.header.e_type != 'ET_CORE':
             raise DumpException("input file is not Core binary")
 
-        self.elf_struct = ELFStructs(self.e_core.little_endian, self.e_core.elfclass)
-        self.elf_struct.create_basic_structs()
-        self.elf_struct.create_advanced_structs(
+        # build struct type
+        self.e_struct = ELFStructs(
+            self.e_core.little_endian, self.e_core.elfclass)
+        self.e_struct.create_basic_structs()
+        self.e_struct.create_advanced_structs(
             self.e_core.header.e_type,
             self.e_core.header.e_machine,
             self.e_core.header.e_ident.EI_OSABI,
         )
 
-        self._vaddr_to_offset_map = []  # [(vaddr, vaddr_end, offset, length), ...]
+        # [(vaddr, vaddr_end, offset, length), ...]
+        self._vaddr_to_offset_map = []
         self._vaddr_to_offset_initialized = False
 
         # init keystone
         self.ks_arch = ks.KS_ARCH_X86
-        self.ks_mode = ks.KS_MODE_LITTLE_ENDIAN if self.e_core.little_endian else ks.KS_MODE_BIG_ENDIAN
+        self.ks_mode = ks.KS_MODE_LITTLE_ENDIAN if self.e_core.little_endian \
+            else ks.KS_MODE_BIG_ENDIAN
         if self.e_core.header.e_machine == 'EM_X86_64':
             self.ks_arch = ks.KS_ARCH_X86
             self.ks_mode |= ks.KS_MODE_64
@@ -102,20 +112,24 @@ class Core2ELF:
         raise UnmapException("offset 0x{0:016x} is not mapped", offset)
 
     def _check_elf_header(self, segment: segments.Segment) -> bool:
+        """
+        try to check if this segment contains elf header
+        """
         if segment.header.p_type != 'PT_LOAD':
             return False
-        return segment.data()[:4] == b'\x7fELF'
+        return segment.data()[:4] == ELF_HDR
 
-    def _write_at_offset(self, off: int, data: str or bytes or bytearray) -> None:
+    def _write_at_offset(self, off: int, data: Data) -> None:
         if off < 0:
-            raise DumpException("cover_binary_data offset < 0, offset: {}".format(off))
+            raise DumpException(
+                "cover_binary_data offset < 0, offset: {}".format(off))
         if isinstance(data, str):
             data = data.encode("latin-1")
         if off > len(self.out_data):
             self.out_data += b'\x00' * (off - len(self.out_data))
         self.out_data[off:off + len(data)] = bytearray(data)
 
-    def _read_mem(self, vaddr, size):
+    def _read_mem(self, vaddr: int, size: int) -> bytes:
         e = self.e_core
         read_size = size
         read_start = vaddr
@@ -125,26 +139,36 @@ class Core2ELF:
             for i in range(e.num_segments()):
                 seg = e.get_segment(i)
                 if seg.header.p_vaddr <= read_start < seg.header.p_vaddr + seg.header.p_memsz:
-                    tmp_read_size = min(read_end, seg.header.p_vaddr + seg.header.p_memsz) - read_start
+                    tmp_read_size = min(
+                        read_end, seg.header.p_vaddr + seg.header.p_memsz) - read_start
                     read_offset = read_start - seg.header.p_vaddr
                     ans += seg.data()[read_offset:read_offset + tmp_read_size]
                     read_start += tmp_read_size
                     read_size -= tmp_read_size
                     break
             else:
-                raise DumpException("can't find target vaddr: 0x{0:016x}".format(read_start))
+                raise DumpException(
+                    "can't find target vaddr: 0x{0:016x}".format(read_start))
 
         return bytes(ans)
 
-    def _write_out(self):
+    def _write_out(self) -> None:
+        """
+        write rebuilt ELF out to file
+        """
         self.out_fp.write(self.out_data)
         self.out_fp.close()
 
-    def _align_page(self, vaddr, pagesize=0x1000):
+    def _align_page(self, vaddr, pagesize=0x1000) -> None:
+        """
+        align address to page end
+        e.g. 0x1200 -> 2000, 0x3000 -> 0x3000
+        """
         return (vaddr + (pagesize - 1)) - (vaddr + (pagesize - 1)) % pagesize
 
-    def _auto_next_segment(self, length, prot):
-        aligned_file_end = self._align_page(len(self.out_data)) + self.d_main_base
+    def _auto_next_segment(self, length: int, prot: int):
+        aligned_file_end = self._align_page(
+            len(self.out_data)) + self.d_main_base
         next_segment_addr = aligned_file_end
         if not self._vaddr_to_offset_initialized:
             raise DumpException("vaddr to offset map is not initialized")
@@ -153,7 +177,7 @@ class Core2ELF:
                 continue
             next_segment_addr = max(next_segment_addr, seg_end)
 
-        phdr = self.elf_struct.Elf_Phdr
+        phdr = self.e_struct.Elf_Phdr
         ans = phdr.parse(b'\x00' * phdr.sizeof())
         ans.p_type = 'PT_LOAD'
         ans.p_flags = prot
@@ -172,7 +196,8 @@ class Core2ELF:
         if self.d_phdr_capacity >= self.d_phdr_elem_size * (self.d_phdr_elem_cnt + 1):
             return self.d_phdr_offset
 
-        new_capacity = self._align_page(self.d_phdr_elem_size * (self.d_phdr_elem_cnt + 1))
+        new_capacity = self._align_page(
+            self.d_phdr_elem_size * (self.d_phdr_elem_cnt + 1))
         phdr_seg = self._auto_next_segment(new_capacity, 5)
         self._write_at_offset(phdr_seg.p_offset, b'\x00' * phdr_seg.p_filesz)
 
@@ -204,7 +229,8 @@ class Core2ELF:
         seg_size = phdr_seg.p_filesz
         seg_v_size = self._align_page(phdr_seg.p_memsz, phdr_seg.p_align)
         seg_vaddr_end = seg_vaddr + seg_v_size
-        self._vaddr_to_offset_map.append((seg_vaddr, seg_vaddr_end, seg_offset, seg_size))
+        self._vaddr_to_offset_map.append(
+            (seg_vaddr, seg_vaddr_end, seg_offset, seg_size))
 
         return self.d_phdr_offset
 
@@ -220,7 +246,7 @@ class Core2ELF:
             # auto next segment
             new_seg = self._auto_next_segment(length, prot)
         else:
-            phdr = self.elf_struct.Elf_Phdr
+            phdr = self.e_struct.Elf_Phdr
             new_seg = phdr.parse(b'\x00' * phdr.sizeof())
             new_seg.p_type = 'PT_LOAD'
             new_seg.p_flags = prot
@@ -251,12 +277,15 @@ class Core2ELF:
         seg_size = new_seg.p_filesz
         seg_v_size = self._align_page(new_seg.p_memsz, new_seg.p_align)
         seg_vaddr_end = seg_vaddr + seg_v_size
-        self._vaddr_to_offset_map.append((seg_vaddr, seg_vaddr_end, seg_offset, seg_size))
+        self._vaddr_to_offset_map.append(
+            (seg_vaddr, seg_vaddr_end, seg_offset, seg_size))
 
         return seg_vaddr
 
-    def _dump_headers(self):
-        # print core segments and let user choose which segment to dump
+    def _dump_headers(self) -> None:
+        """
+        print core segments and let user choose which segment to dump
+        """
         Log.d("Print segments from core file ...")
         print("\nIndex  Type     Virt. addr. start    Virt. addr. end     Flags")
         for i in range(self.e_core.num_segments()):
@@ -292,22 +321,28 @@ class Core2ELF:
         Log.d("Please specify a text segment index (usually the first segment contains elf header)")
         seg_index = int(input("> "))
         if not self._check_elf_header(self.e_core.get_segment(seg_index)):
-            raise DumpException("The segment you choose doesn't have elf header, this tool can't dump elf from it")
+            raise DumpException(
+                "The segment you choose doesn't have elf header, this tool can't dump elf from it")
         print("")
 
         # dump ehdr, phdr, segments
         self.d_main_seg: segments.Segment = self.e_core.get_segment(seg_index)
-        self.d_ehdr = self.elf_struct.Elf_Ehdr.parse(self.d_main_seg.data())
+        self.d_ehdr = self.e_struct.Elf_Ehdr.parse(self.d_main_seg.data())
         self.d_ehdr.e_shoff = 0
         self.d_ehdr.e_shnum = 0
+        entry_point = self.d_ehdr.e_entry
+        Log.d("found entry point: 0x{:016x}".format(entry_point))
 
         # do some check to ehdr
         if self.d_ehdr.e_type not in ('ET_EXEC', 'ET_DYN'):
-            raise DumpException("dump file has unsupported file type: {}".format(self.d_ehdr.e_type))
+            raise DumpException(
+                "dump file has unsupported file type: {}".format(self.d_ehdr.e_type))
 
         self.d_main_base = self.d_main_seg.header.p_vaddr
         self.d_is_dyn_elf = self.d_ehdr.e_type == 'ET_DYN'
         self.d_dyn_base = self.d_main_base if self.d_is_dyn_elf else 0
+        if self.d_is_dyn_elf:
+            Log.d("dynamic elf, base: 0x{:016x}".format(self.d_dyn_base))
 
         # searching phdr
         self.d_phdr_offset = self.d_ehdr.e_phoff
@@ -319,19 +354,20 @@ class Core2ELF:
         for i in range(self.d_phdr_elem_cnt):
             data = self._read_mem(self.d_main_base + self.d_phdr_offset + self.d_phdr_elem_size * i,
                                   self.d_phdr_elem_size)
-            phdr = self.elf_struct.Elf_Phdr.parse(data)
+            phdr = self.e_struct.Elf_Phdr.parse(data)
             if phdr.p_type == 'PT_DYNAMIC':
                 self.d_dynamic_phdr = phdr
             self.d_phdr.append(phdr)
 
-    def _dump_segments(self):
+    def _dump_segments(self) -> None:
         # dump all segments and build vaddr_to_offset_map
         Log.d("Dump ELF segments ...")
         for phdr in self.d_phdr:
             if phdr.p_type == 'PT_LOAD':
                 seg_vaddr = self.d_dyn_base + phdr.p_vaddr
                 seg_size = phdr.p_filesz
-                seg_vaddr_end = self._align_page(seg_vaddr + phdr.p_memsz, phdr.p_align)
+                seg_vaddr_end = self._align_page(
+                    seg_vaddr + phdr.p_memsz, phdr.p_align)
                 seg_data = self._read_mem(seg_vaddr, seg_size)
 
                 perm_r = (phdr.p_flags & 0b100) != 0
@@ -355,13 +391,14 @@ class Core2ELF:
                 ))
 
                 self._write_at_offset(phdr.p_offset, seg_data)
-                self._vaddr_to_offset_map.append((seg_vaddr, seg_vaddr_end, phdr.p_offset, seg_size))
+                self._vaddr_to_offset_map.append(
+                    (seg_vaddr, seg_vaddr_end, phdr.p_offset, seg_size))
         self._vaddr_to_offset_initialized = True
 
         Log.i("Dump segments success")
         print("")
 
-    def _fix_dynamic(self):
+    def _fix_dynamic(self) -> None:
         Log.d("Try to fix dynamic table ...")
 
         self.d_dynamic = []
@@ -372,10 +409,11 @@ class Core2ELF:
         dynamic_vaddr = self.d_dyn_base + self.d_dynamic_phdr.p_vaddr
         seg_size = self.d_dynamic_phdr.p_filesz
         dynamic_data = self._read_mem(dynamic_vaddr, seg_size)
-        dynamic_elem_size = self.elf_struct.Elf_Dyn.sizeof()
+        dynamic_elem_size = self.e_struct.Elf_Dyn.sizeof()
 
         for i in range(seg_size // dynamic_elem_size):
-            dyn = self.elf_struct.Elf_Dyn.parse(dynamic_data[dynamic_elem_size * i:])
+            dyn = self.e_struct.Elf_Dyn.parse(
+                dynamic_data[dynamic_elem_size * i:])
             if dyn.d_tag in ('DT_GNU_HASH', 'DT_STRTAB', 'DT_SYMTAB',
                              'DT_PLTGOT', 'DT_JMPREL', 'DT_RELA', 'DT_VERSYM'):
                 dyn.d_val -= self.d_dyn_base
@@ -384,13 +422,14 @@ class Core2ELF:
                 dyn.d_val = 0
                 dyn.d_ptr = dyn.d_val
             self.d_dynamic.append(dyn)
-            dyn_data = self.elf_struct.Elf_Dyn.build(dyn)
-            self._write_at_offset(self.d_dynamic_phdr.p_offset + dynamic_elem_size * i, dyn_data)
+            dyn_data = self.e_struct.Elf_Dyn.build(dyn)
+            self._write_at_offset(
+                self.d_dynamic_phdr.p_offset + dynamic_elem_size * i, dyn_data)
 
         Log.i("Fix dynamic table success")
         print("")
 
-    def _fix_rela(self):
+    def _fix_rela(self) -> None:
         Log.d("Try to fix RELA table ...")
 
         if not self.d_dynamic:
@@ -415,24 +454,27 @@ class Core2ELF:
 
         rel_cnt = rela_size // rela_elem_size
         for i in range(rel_cnt):
-            d = self.elf_struct.Elf_Rela.parse(self._read_mem(rela_addr + i * rela_elem_size, rela_elem_size))
+            d = self.e_struct.Elf_Rela.parse(self._read_mem(
+                rela_addr + i * rela_elem_size, rela_elem_size))
             if d.r_info_type in (8, 6):
                 addr = self.d_dyn_base + d.r_offset
-                data = self.elf_struct.Elf_sxword('r_addend').build(d.r_addend)
+                data = self.e_struct.Elf_sxword('r_addend').build(d.r_addend)
                 self._write_at_offset(self._vaddr_to_offset(addr), data)
 
         Log.i("Fix RELA table success")
         print("")
 
-    def _fix_got_x86_64(self, jmprel_addr, rel_cnt, rel_elem_size, plt_got, plt_rel):
-        offset_type = self.elf_struct.Elf_offset('ptr')
+    def _fix_got_x86_64(self, jmprel_addr, rel_cnt, rel_elem_size, plt_got, plt_rel) -> bool:
+        offset_type = self.e_struct.Elf_offset('ptr')
 
         # clear GOT[1] and GOT[2]
         Log.d("clear GOT[1] and GOT[2] ...")
         got1_addr = plt_got + offset_type.sizeof() * 1
         got2_addr = plt_got + +offset_type.sizeof() * 2
-        self._write_at_offset(self._vaddr_to_offset(got1_addr), offset_type.build(0))
-        self._write_at_offset(self._vaddr_to_offset(got2_addr), offset_type.build(0))
+        self._write_at_offset(self._vaddr_to_offset(
+            got1_addr), offset_type.build(0))
+        self._write_at_offset(self._vaddr_to_offset(
+            got2_addr), offset_type.build(0))
 
         # search PLT[0] pattern
         Log.d("searching PLT[0] ...")
@@ -451,7 +493,8 @@ class Core2ELF:
             except UnmapException:
                 continue
 
-            expect_asm, _ = self.ks.asm("push [{}]".format(got1_addr), find_vaddr)
+            expect_asm, _ = self.ks.asm(
+                "push [{}]".format(got1_addr), find_vaddr)
             if bytes(expect_asm) == self.out_data[find_pos:find_pos + len(expect_asm)]:
                 find_plt_vaddr = find_vaddr
                 find_plt0 = True
@@ -477,22 +520,25 @@ class Core2ELF:
 
         Log.d("Walking through rel table ...")
         for i in range(rel_cnt):
-            d = self.elf_struct.Elf_Rela.parse(self._read_mem(jmprel_addr + i * rel_elem_size, rel_elem_size))
+            d = self.e_struct.Elf_Rela.parse(self._read_mem(
+                jmprel_addr + i * rel_elem_size, rel_elem_size))
             if d.r_info_type == plt_rel:
                 got_addr = d.r_offset + self.d_dyn_base
 
                 # search PLT[i] for this GOT by pattern
-                pat = b"(\\xF3\\x0F\\x1E\\xFA)?\\x68" + int_to_re_pattern(i).encode('utf8') + b"(\\xF2)?\\xE9"
+                pat = b"(\\xF3\\x0F\\x1E\\xFA)?\\x68" + \
+                    int_to_re_pattern(i).encode('utf8') + b"(\\xF2)?\\xE9"
                 match = re.search(pat, plt_data)
                 if not match:
                     Log.w("can't find PLT[{}] pattern".format(i))
                     return False
                 find_pos = find_plt_vaddr + match.start()
-                self._write_at_offset(self._vaddr_to_offset(got_addr), offset_type.build(find_pos - self.d_dyn_base))
+                self._write_at_offset(self._vaddr_to_offset(
+                    got_addr), offset_type.build(find_pos - self.d_dyn_base))
 
         return True
 
-    def _fix_got_table(self):
+    def _fix_got_table(self) -> None:
         Log.d("Try to fix GOT table ...")
         if not self.d_dynamic:
             Log.w("Dynamic table are missing")
@@ -529,13 +575,13 @@ class Core2ELF:
             return
 
         if not fptr_fix_got(jmprel_addr, rel_cnt, rel_elem_size, plt_got, plt_rel):
-            Log.w("fix .got table is currently not supported for arch {}".format(e_arch))
+            Log.w("fix .got table failed")
             return
 
         Log.i("Fix GOT table success")
         print("")
 
-    def _add_dummy_section(self):
+    def _add_dummy_section(self) -> None:
         Log.d("Add dummy section, or gdb can't recognize it")
 
         # add dummy section, or gdb can't recognize it
@@ -547,7 +593,7 @@ class Core2ELF:
 
         section_off = self._align_page(len(self.out_data), 0x10)
         sections = []
-        shdr = self.elf_struct.Elf_Shdr
+        shdr = self.e_struct.Elf_Shdr
         dummy_section = shdr.parse(b'\x00' * shdr.sizeof())
         sections.append(dummy_section)
         shstrtab_section = shdr.parse(b'\x00' * shdr.sizeof())
@@ -559,7 +605,8 @@ class Core2ELF:
 
         for i, section in enumerate(sections):
             section_data = shdr.build(section)
-            self._write_at_offset(section_off + shdr.sizeof() * i, section_data)
+            self._write_at_offset(
+                section_off + shdr.sizeof() * i, section_data)
 
         self.d_ehdr.e_shoff = section_off
         self.d_ehdr.e_shnum = len(sections)
@@ -568,7 +615,10 @@ class Core2ELF:
         Log.i("Add section success")
         print("")
 
-    def dump(self):
+    def dump(self) -> None:
+        """
+        dump function entrypoint
+        """
         self._dump_headers()
         self._dump_segments()
         self._fix_dynamic()
@@ -579,12 +629,12 @@ class Core2ELF:
         # dump phdr
         start_pos = self.d_ehdr.e_phoff
         for i in range(len(self.d_phdr)):
-            phdr = self.elf_struct.Elf_Phdr.build(self.d_phdr[i])
+            phdr = self.e_struct.Elf_Phdr.build(self.d_phdr[i])
             self._write_at_offset(start_pos, phdr)
             start_pos += len(phdr)
 
         # dump header
-        dump_hdr_bin = self.elf_struct.Elf_Ehdr.build(self.d_ehdr)
+        dump_hdr_bin = self.e_struct.Elf_Ehdr.build(self.d_ehdr)
         self._write_at_offset(0, dump_hdr_bin)
 
         self._write_out()
@@ -592,7 +642,7 @@ class Core2ELF:
         Log.i("Write out dump elf file success")
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 3:
         print("Usage: {} core_filename out_filename".format(sys.argv[0]))
         exit(1)
@@ -604,3 +654,7 @@ if __name__ == "__main__":
         Core2ELF(in_filename, out_filename).dump()
     except DumpException as ex:
         Log.e(str(ex))
+
+
+if __name__ == "__main__":
+    main()
