@@ -88,6 +88,9 @@ class Core2ELF:
         if self.e_core.header.e_machine == 'EM_X86_64':
             self.ks_arch = ks.KS_ARCH_X86
             self.ks_mode |= ks.KS_MODE_64
+        elif self.e_core.header.e_machine == 'EM_386':
+            self.ks_arch = ks.KS_ARCH_X86
+            self.ks_mode |= ks.KS_MODE_32
         else:
             raise DumpException("Unsupported binary")
         self.ks = ks.Ks(self.ks_arch, self.ks_mode)
@@ -414,7 +417,7 @@ class Core2ELF:
         for i in range(seg_size // dynamic_elem_size):
             dyn = self.e_struct.Elf_Dyn.parse(
                 dynamic_data[dynamic_elem_size * i:])
-            if dyn.d_tag in ('DT_GNU_HASH', 'DT_STRTAB', 'DT_SYMTAB',
+            if dyn.d_tag in ('DT_GNU_HASH', 'DT_STRTAB', 'DT_SYMTAB', 'DT_REL',
                              'DT_PLTGOT', 'DT_JMPREL', 'DT_RELA', 'DT_VERSYM'):
                 dyn.d_val -= self.d_dyn_base
                 dyn.d_ptr = dyn.d_val
@@ -429,39 +432,46 @@ class Core2ELF:
         Log.i("Fix dynamic table success")
         print("")
 
-    def _fix_rela(self) -> None:
-        Log.d("Try to fix RELA table ...")
+    def _fix_relocation(self) -> None:
+        Log.d("Try to fix relocation table ...")
 
         if not self.d_dynamic:
             Log.w("Dynamic table are missing")
             return
 
-        rela_addr = 0
-        rela_size = 0
-        rela_elem_size = 0
+        self.rel_is_rela = False
+        
+        rel_addr = 0
+        rel_size = 0
+        rel_elem_size = 0
 
         for dyn in self.d_dynamic:
-            if dyn.d_tag == 'DT_RELA':
-                rela_addr = self.d_dyn_base + dyn.d_val
-            elif dyn.d_tag == 'DT_RELASZ':
-                rela_size = dyn.d_val
-            elif dyn.d_tag == 'DT_RELAENT':
-                rela_elem_size = dyn.d_val
+            if dyn.d_tag in ['DT_RELA', 'DT_REL']:
+                rel_addr = self.d_dyn_base + dyn.d_val
+                if dyn.d_tag == 'DT_RELA':
+                    self.rel_is_rela = True
+            elif dyn.d_tag in ['DT_RELASZ', 'DT_RELSZ']:
+                rel_size = dyn.d_val
+            elif dyn.d_tag in ['DT_RELAENT', 'DT_RELENT']:
+                rel_elem_size = dyn.d_val
 
-        if not (rela_addr and rela_size and rela_elem_size):
-            Log.w("Some important dynamic tag are missing, skip RELA fixing")
+        if not (rel_addr and rel_size and rel_elem_size):
+            Log.w("Some important dynamic tag are missing, skip relocation fixing")
             return
 
-        rel_cnt = rela_size // rela_elem_size
+        self.rel_type = self.e_struct.Elf_Rela if self.rel_is_rela else self.e_struct.Elf_Rel
+        rel_cnt = rel_size // rel_elem_size
         for i in range(rel_cnt):
-            d = self.e_struct.Elf_Rela.parse(self._read_mem(
-                rela_addr + i * rela_elem_size, rela_elem_size))
+            d = self.rel_type.parse(self._read_mem(
+                rel_addr + i * rel_elem_size, rel_elem_size))
             if d.r_info_type in (8, 6):
                 addr = self.d_dyn_base + d.r_offset
-                data = self.e_struct.Elf_sxword('r_addend').build(d.r_addend)
-                self._write_at_offset(self._vaddr_to_offset(addr), data)
+                if self.rel_is_rela:
+                    data = self.e_struct.Elf_sxword(
+                        'r_addend').build(d.r_addend)
+                    self._write_at_offset(self._vaddr_to_offset(addr), data)
 
-        Log.i("Fix RELA table success")
+        Log.i("Fix relocation table success")
         print("")
 
     def _fix_got_x86_64(self, jmprel_addr, rel_cnt, rel_elem_size, plt_got, plt_rel) -> bool:
@@ -470,7 +480,7 @@ class Core2ELF:
         # clear GOT[1] and GOT[2]
         Log.d("clear GOT[1] and GOT[2] ...")
         got1_addr = plt_got + offset_type.sizeof() * 1
-        got2_addr = plt_got + +offset_type.sizeof() * 2
+        got2_addr = plt_got + offset_type.sizeof() * 2
         self._write_at_offset(self._vaddr_to_offset(
             got1_addr), offset_type.build(0))
         self._write_at_offset(self._vaddr_to_offset(
@@ -522,19 +532,116 @@ class Core2ELF:
         for i in range(rel_cnt):
             d = self.e_struct.Elf_Rela.parse(self._read_mem(
                 jmprel_addr + i * rel_elem_size, rel_elem_size))
-            if d.r_info_type == plt_rel:
-                got_addr = d.r_offset + self.d_dyn_base
+            # if d.r_info_type == plt_rel:
+            got_addr = d.r_offset + self.d_dyn_base
 
-                # search PLT[i] for this GOT by pattern
-                pat = b"(\\xF3\\x0F\\x1E\\xFA)?\\x68" + \
-                    int_to_re_pattern(i).encode('utf8') + b"(\\xF2)?\\xE9"
-                match = re.search(pat, plt_data)
-                if not match:
-                    Log.w("can't find PLT[{}] pattern".format(i))
-                    return False
-                find_pos = find_plt_vaddr + match.start()
-                self._write_at_offset(self._vaddr_to_offset(
-                    got_addr), offset_type.build(find_pos - self.d_dyn_base))
+            # search PLT[i] for this GOT by pattern
+            pat = b"(\\xF3\\x0F\\x1E\\xFA)?\\x68" + \
+                int_to_re_pattern(i).encode('utf8') + b"(\\xF2)?\\xE9"
+            match = re.search(pat, plt_data)
+            if not match:
+                Log.w("can't find PLT[{}] pattern".format(i))
+                return False
+            find_pos = find_plt_vaddr + match.start()
+            self._write_at_offset(self._vaddr_to_offset(
+                got_addr), offset_type.build(find_pos - self.d_dyn_base))
+
+        return True
+
+    def _fix_got_i386(self, jmprel_addr, rel_cnt, rel_elem_size, plt_got, plt_rel) -> bool:
+        """
+        base on PIE, i386
+        """
+        offset_type = self.e_struct.Elf_offset('ptr')
+
+        Log.d("clear GOT[1] and GOT[2] ...")
+        got_addr = 0
+        for dyn in self.d_dynamic:
+            if dyn.d_tag == 'DT_PLTGOT':
+                got_addr = dyn.d_val + self.d_dyn_base
+                break
+        if got_addr:
+            got1_addr = got_addr + offset_type.sizeof() * 1
+            got2_addr = got_addr + offset_type.sizeof() * 2
+            self._write_at_offset(self._vaddr_to_offset(
+                got1_addr), offset_type.build(0))
+            self._write_at_offset(self._vaddr_to_offset(
+                got2_addr), offset_type.build(0))
+
+        # search PLT[0] pattern
+        Log.d("searching PLT[0] ...")
+        find_plt0 = False
+        find_plt_vaddr = 0
+        find_pos = 0
+        while find_pos >= 0:
+            find_pos += 2
+            # searching for PIE version PLT[0]
+            find_pos = self.out_data.find(
+                b"\xFF\xB3\x04\x00\x00\x00\xFF\xA3\x08\x00\x00\x00", find_pos)
+            if find_pos < 0:
+                break
+            # check PLT[0]
+            try:
+                find_vaddr = self._offset_to_vaddr(find_pos)
+            except UnmapException:
+                continue
+
+            find_plt_vaddr = find_vaddr
+            find_plt0 = True
+            break
+
+        if not find_plt0:
+            Log.w("Can't find PLT[0], stop GOT fixing")
+            return False
+        else:
+            Log.d("find PLT[0] !")
+
+        approx_plt_size = 0
+        if not self._vaddr_to_offset_initialized:
+            raise DumpException("vaddr to offset map is not initialized")
+        for vaddr, vaddr_end, _, length in self._vaddr_to_offset_map:
+            if vaddr <= find_plt_vaddr < vaddr + length:
+                approx_plt_size = vaddr + length - find_plt_vaddr
+        plt_data = self._read_mem(find_plt_vaddr, approx_plt_size)
+
+        # walk through rel table
+        def int_to_re_pattern(num):
+            return ''.join(map(lambda x: "\\x{:02x}".format(x), struct.pack("<I", num)))
+
+        Log.d("Walking through rel table ...")
+        for i in range(rel_cnt):
+            d = self.rel_type.parse(self._read_mem(
+                jmprel_addr + i * rel_elem_size, rel_elem_size))
+            got_elem_addr = d.r_offset + self.d_dyn_base
+            # search PLT[i] for this GOT by pattern
+            pat = b"(\\xF3\\x0F\\x1E\\xFB)?\\x68" + \
+                int_to_re_pattern(i*8).encode('utf8') + b"(\\xF2)?\\xE9"
+            match = re.search(pat, plt_data)
+            if not match:
+                Log.w("can't find PLT[{}] pattern".format(i))
+                return False
+            find_pos = find_plt_vaddr + match.start()
+            self._write_at_offset(self._vaddr_to_offset(
+                got_elem_addr), offset_type.build(find_pos - self.d_dyn_base))
+
+        elem_sz = offset_type.sizeof()
+        # TODO: ugly .GOT fix, try to fix me 
+        if self.d_dyn_base:
+            i = 2
+            while True:
+                i+=1
+                got_elem_addr = got_addr + elem_sz * i
+                try:
+                    val = offset_type.parse(self._read_mem(got_elem_addr, elem_sz))
+                except DumpException:
+                    break
+                try:
+                    self._vaddr_to_offset(val)
+                except UnmapException:
+                    continue
+                val -= self.d_dyn_base
+                self._write_at_offset(
+                    self._vaddr_to_offset(got_elem_addr), offset_type.build(val))
 
         return True
 
@@ -555,7 +662,7 @@ class Core2ELF:
                 jmprel_addr = dyn.d_val + self.d_dyn_base
             elif dyn.d_tag == 'DT_PLTRELSZ':
                 rel_size = dyn.d_val
-            elif dyn.d_tag == 'DT_RELAENT':
+            elif dyn.d_tag in ['DT_RELAENT', 'DT_RELENT']:
                 rel_elem_size = dyn.d_val
             elif dyn.d_tag == 'DT_PLTREL':
                 plt_rel = dyn.d_val
@@ -570,6 +677,8 @@ class Core2ELF:
         e_arch = self.d_ehdr.e_machine
         if e_arch == 'EM_X86_64':
             fptr_fix_got = self._fix_got_x86_64
+        elif e_arch == 'EM_386':
+            fptr_fix_got = self._fix_got_i386
         else:
             Log.w("fix GOT table is currently not supported for arch {}".format(e_arch))
             return
@@ -615,6 +724,48 @@ class Core2ELF:
         Log.i("Add section success")
         print("")
 
+    def _fix_init_fini(self):
+        Log.d("Try to fix .init and .fini table ...")
+        if not self.d_dynamic:
+            Log.w("Dynamic table are missing")
+            return
+
+        init_array = 0
+        fini_array = 0
+        init_array_cnt = 0
+        fini_array_cnt = 0
+        elem_type = self.e_struct.Elf_offset('x')
+        elem_sz = elem_type.sizeof()
+
+        for dyn in self.d_dynamic:
+            if dyn.d_tag == 'DT_INIT_ARRAY':
+                init_array = dyn.d_val + self.d_dyn_base
+            elif dyn.d_tag == 'DT_FINI_ARRAY':
+                fini_array = dyn.d_val + self.d_dyn_base
+            elif dyn.d_tag == 'DT_INIT_ARRAYSZ':
+                init_array_cnt = dyn.d_val // elem_sz
+            elif dyn.d_tag == 'DT_FINI_ARRAYSZ':
+                fini_array_cnt = dyn.d_val // elem_sz
+
+        for i in range(init_array_cnt):
+            addr = init_array+elem_sz*i
+            val = self._read_mem(addr, elem_sz)
+            val = elem_type.parse(val)
+            val -= self.d_dyn_base
+            self._write_at_offset(
+                self._vaddr_to_offset(addr), elem_type.build(val))
+
+        for i in range(fini_array_cnt):
+            addr = fini_array+elem_sz*i
+            val = self._read_mem(addr, elem_sz)
+            val = elem_type.parse(val)
+            val -= self.d_dyn_base
+            self._write_at_offset(
+                self._vaddr_to_offset(addr), elem_type.build(val))
+
+        Log.i("fix .init and .fini success")
+        print("")
+
     def dump(self) -> None:
         """
         dump function entrypoint
@@ -622,8 +773,9 @@ class Core2ELF:
         self._dump_headers()
         self._dump_segments()
         self._fix_dynamic()
-        self._fix_rela()
+        self._fix_relocation()
         self._fix_got_table()
+        self._fix_init_fini()
         self._add_dummy_section()
 
         # dump phdr
